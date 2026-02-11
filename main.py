@@ -4,12 +4,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-# Загружаем переменные из .env (файл должен лежать рядом с main.py)
+# Загружаем переменные из .env (локально). На Railway переменные берутся из Variables.
 load_dotenv()
 
-# Используем 127.0.0.1 вместо localhost (на macOS так стабильнее)
+# Langflow config
 LANGFLOW_URL = (os.getenv("LANGFLOW_URL") or "http://127.0.0.1:7860").rstrip("/")
 LANGFLOW_FLOW_ID = os.getenv("LANGFLOW_FLOW_ID") or ""
 LANGFLOW_API_KEY = os.getenv("LANGFLOW_API_KEY") or ""
@@ -17,7 +18,10 @@ LANGFLOW_API_KEY = os.getenv("LANGFLOW_API_KEY") or ""
 LANGFLOW_INPUT_TYPE = os.getenv("LANGFLOW_INPUT_TYPE") or "chat"
 LANGFLOW_OUTPUT_TYPE = os.getenv("LANGFLOW_OUTPUT_TYPE") or "chat"
 
-# Проверяем, что все нужные переменные заданы
+# CORS config (для Lovable/браузера)
+LOVEABLE_ORIGIN = os.getenv("LOVEABLE_ORIGIN") or ""  # например: https://happy-multiply-box.lovable.app
+CORS_ALLOW_ALL = (os.getenv("CORS_ALLOW_ALL") or "").lower() in ("1", "true", "yes")
+
 missing: List[str] = []
 for k, v in [
     ("LANGFLOW_URL", LANGFLOW_URL),
@@ -28,15 +32,35 @@ for k, v in [
         missing.append(k)
 
 if missing:
-    raise RuntimeError(f"Missing required env vars in .env: {', '.join(missing)}")
+    raise RuntimeError(f"Missing required env vars: {', '.join(missing)}")
 
 app = FastAPI(title="Langflow FastAPI Proxy")
 
-# trust_env=False — игнорируем системные прокси
-client = httpx.AsyncClient(
-    timeout=httpx.Timeout(900.0),
-    trust_env=False,
+# --- CORS ---
+# В проде лучше строго разрешать только домен Lovable.
+# Для быстрой отладки можно включить CORS_ALLOW_ALL=true
+if CORS_ALLOW_ALL:
+    allow_origins = ["*"]
+else:
+    allow_origins = [LOVEABLE_ORIGIN] if LOVEABLE_ORIGIN else []
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allow_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
 )
+
+# --- HTTP client ---
+# trust_env=False — игнорируем системные прокси (часто ломают локальные/railway вызовы)
+timeout = httpx.Timeout(connect=10.0, read=120.0, write=120.0, pool=10.0)
+client = httpx.AsyncClient(timeout=timeout, trust_env=False)
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    await client.aclose()
 
 
 class MultiplyRequest(BaseModel):
@@ -52,6 +76,7 @@ def _extract_text_from_langflow(resp_json: Dict[str, Any]) -> Optional[str]:
 
 
 def _make_auth_headers() -> List[Dict[str, str]]:
+    # Langflow иногда ожидает один из двух вариантов авторизации
     return [
         {"Authorization": f"Bearer {LANGFLOW_API_KEY}"},
         {"x-api-key": LANGFLOW_API_KEY},
@@ -80,6 +105,7 @@ async def _run_langflow(input_value: str, session_id: str) -> Tuple[Dict[str, An
             last_status = r.status_code
             last_text = r.text
 
+            # если не подошёл способ авторизации — пробуем следующий
             if r.status_code in (401, 403):
                 continue
 
@@ -87,9 +113,16 @@ async def _run_langflow(input_value: str, session_id: str) -> Tuple[Dict[str, An
             return r.json(), ("bearer" if "Authorization" in auth else "x-api-key")
 
         except httpx.HTTPStatusError as e:
+            # Langflow вернул 4xx/5xx — пробрасываем как есть
             raise HTTPException(
                 status_code=e.response.status_code,
                 detail=e.response.text,
+            ) from e
+
+        except httpx.ReadTimeout as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Langflow request error: ReadTimeout {repr(e)}",
             ) from e
 
         except httpx.RequestError as e:
@@ -98,10 +131,11 @@ async def _run_langflow(input_value: str, session_id: str) -> Tuple[Dict[str, An
                 detail=f"Langflow request error: {type(e).__name__} {repr(e)}",
             ) from e
 
+    # если оба способа auth дали 401/403
     raise HTTPException(
         status_code=502,
         detail=(
-            f"Langflow auth failed (tried Bearer and x-api-key). "
+            "Langflow auth failed (tried Bearer and x-api-key). "
             f"Last status={last_status}. Last response={last_text}"
         ),
     )
@@ -132,4 +166,3 @@ async def multiply(req: MultiplyRequest) -> Dict[str, Any]:
         "result_text": _extract_text_from_langflow(resp_json),
         "raw": resp_json,
     }
-
